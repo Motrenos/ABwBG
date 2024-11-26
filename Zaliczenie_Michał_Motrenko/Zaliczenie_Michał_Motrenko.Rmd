@@ -1,0 +1,170 @@
+---
+title: "Analiza NGS: Mapowanie odczytów Escherichia coli"
+author: "Michał M"
+date: "2024-11-26"
+output: html_document
+---
+# Pozostałe wykresy oraz raporty zostały zapisane i umieszczone w odpowiednim folderze na GitHubie.
+```{r, Wczytywanie plików FASTQ i kontrola jakości przed trymowaniem}
+# Instalacja i załadowanie pakietów
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+BiocManager::install(c("ShortRead", "Biostrings", "Rsubread", "GenomicAlignments")) # Sprawdzenie i instalacja pakietu BiocManager do zarządzania pakietami Bioconductor
+
+# ShortRead - do pracy z plikami FASTQ i QC
+# Biostrings - do manipulacji sekwencjami DNA/RNA
+# Rsubread - do mapowania odczytów na genom referencyjny
+# GenomicAlignments - do analizy plików BAM i wyników mapowania
+
+# Załadowanie bibliotek
+library(ShortRead) # Wczytywanie danych FASTQ, kontrola jakości
+library(Biostrings) # Operacje na sekwencjach (np. obliczanie GC, usuwanie adapterów)
+library(Rsubread) # Narzędzia do mapowania odczytów na genom referencyjny
+library(GenomicAlignments) # Analiza wyników mapowania z plików BAM
+
+# Ustawienie ścieżki do katalogu wyjściowego na wyniki analizy
+fastq_file <- "C:/Users/moren/Documents/R/Zaliczenie/ecoli_raw.fq" # Plik FASTQ zawiera sekwencje DNA/RNA z informacjami o jakości
+output_dir <- "C:/Users/moren/Documents/R/Zaliczenie/Raport"
+dir.create(output_dir, showWarnings = FALSE) # Tworzenie folderu, jeśli nie istnieje, aby zapisać wyniki analizy
+
+# Zdefiniowanie nazw plików wyjściowych
+preprocessed_fastq <- file.path(output_dir, "preprocessed_ecoli.fq") # Plik FASTQ po preprocessingu
+bam_file <- file.path(output_dir, "aligned_reads.bam") # Plik BAM zawierający wyniki mapowania odczytów na genom referencyjny
+qc_report <- file.path(output_dir, "QC_report.html") # Raport jakości danych wygenerowany przez pakiet ShortRead
+```
+
+```{r Kontrola jakości przed przetwarzaniem}
+# Wczytaj dane FASTQ
+fq_reads <- readFastq(fastq_file) # Ładowanie danych sekwencyjnych z pliku FASTQ. 
+# Każdy odczyt zawiera sekwencję nukleotydów oraz odpowiadające jej wartości jakości (Phred).
+
+# Histogram długości odczytów
+hist(width(fq_reads), breaks = 50, col = "skyblue",
+     main = "Długości odczytów przed preprocessingiem",
+     xlab = "Długość odczytu (bp)") # Wizualizacja rozkładu długości odczytów w danych. 
+# Pozwala zidentyfikować odczyty zbyt krótkie lub zbyt długie, które mogą wymagać filtracji.
+
+# Podstawowe statystyki
+cat("Liczba odczytów:", length(fq_reads), "\n") # Wyświetla liczbę odczytów w danych FASTQ.
+
+cat("Długości odczytów: min =", min(width(fq_reads)), 
+    "bp, max =", max(width(fq_reads)), "bp\n") # Wyświetla minimalną i maksymalną długość odczytów, co pomaga ocenić ich jakość.
+
+# Wizualizacja jakości baz
+# Konwersja jakości na wartości numeryczne
+quality_scores <- as.numeric(as(quality(fq_reads), "matrix")) # Pobiera wartości jakości Phred z danych FASTQ i konwertuje je do postaci numerycznej. # Pozwala na dalszą analizę i wizualizację jakości.
+
+# Rysowanie histogramu jakości
+hist(quality_scores, breaks = 50, 
+     main = "Rozkład jakości przed preprocess", 
+     xlab = "Jakość (Phred)", col = "skyblue", border = "black") # Wizualizacja jakości baz w danych. Histogram pokazuje rozkład wartości jakości Phred, co pozwala zidentyfikować bazy o niskiej jakości, które mogą wymagać przycięcia.
+
+# Konwersja jakości na wartości numeryczne
+quality_scores <- as.numeric(as(quality(fq_reads), "matrix"))
+
+# Generowanie raportu QC
+qa_results <- qa(fastq_file, type = "fastq")
+report(qa_results, dest = "C:/Users/moren/Documents/R/Zaliczenie/QA_report.html") # Tworzenie obiektu z wynikami kontroli jakości. Funkcja `qa()` analizuje dane FASTQ i generuje statystyki, takie jak długość odczytów, wartości jakości i liczba odczytów.
+
+# Analiza zawartości GC
+gc_content <- letterFrequency(sread(fq_reads), letters = "GC", as.prob = TRUE) # Obliczanie zawartości GC dla każdego odczytu w danych FASTQ. Zwraca wartość procentową nukleotydów G i C w każdej sekwencji.
+
+# Histogram zawartości GC
+hist(gc_content, breaks = 50,
+     main = "Zawartość GC w oryginalnych odczytach",
+     xlab = "Procent GC", col = "lightgreen", border = "black") # Wizualizacja zawartości GC w danych FASTQ. Histogram przedstawia rozkład procentowy GC. Pozwala zidentyfikować ewentualne odchylenia, takie jak bias w zawartości GC.
+```
+# Dane jakościowe wykazują pewne niedoskonałości, co sugerują dwa wyraźne peaki na wykresie. Taki rozkład wskazuje na potencjalne obszary wymagające poprawy, szczególnie w kontekście jakości końcowych cykli sekwencjonowania lub obecności zanieczyszczeń w danych.
+# Procent zawartości GC w sekwencji odgrywa kluczową rolę w ocenie stabilności nici DNA. Wyższa zawartość GC zazwyczaj wskazuje na silniejsze wiązania między łańcuchami, co przekłada się na większą stabilność strukturalną tej nici.
+
+```{r Przycinanie i Filtracja odczytów}
+# Przycinanie niskiej jakości baz z końców odczytów
+trimmed_reads <- trimTailw(fq_reads, k = 2, a = "B", halfwidth = 1, successive = TRUE)
+# Funkcja `trimTailw()` przycina bazy o niskiej jakości z końców odczytów.
+# Parametry:
+# - `k = 2`: Minimalna liczba kolejnych baz o niskiej jakości (Q10 lub mniej, odpowiadającej "B").
+# - `a = "B"`: Symbol odpowiadający minimalnej akceptowalnej jakości w skali Phred.
+# - `halfwidth = 1`: Rozmiar okna do uśredniania jakości podczas analizy.
+# - `successive = TRUE`: Wymusza przycinanie, jeśli niska jakość występuje kolejno.
+# Wynik: odczyty o niskiej jakości na końcach zostają przycięte.
+
+# Usuwanie sekwencji adapterów
+adapter_seq <- DNAString("AGATCGGAAGAGC")
+trimmed_reads <- trimLRPatterns(Lpattern = adapter_seq, subject = trimmed_reads) # Definicja sekwencji adaptera Illumina ("AGATCGGAAGAGC") w formacie `DNAString`.
+
+# Filtracja zbyt krótkich odczytów (próg: 50 bp)
+filtered_reads <- trimmed_reads[width(trimmed_reads) >= 50] # Usuwanie odczytów krótszych niż 50 bp.
+
+# Zapis przetworzonych odczytów
+
+preprocessed_fastq <- "C:/Users/moren/Documents/R/Zaliczenie/Raport/preprocessed_ecoli.fq"
+writeFastq(filtered_reads, preprocessed_fastq) # Funkcja `writeFastq()` zapisuje przetworzone odczyty do nowego pliku FASTQ.
+
+cat("Liczba odczytów po przycinaniu i filtracji:", length(filtered_reads), "\n") 
+```
+
+```{r Mapowanie do genomu referencyjnego}
+# Przygotowanie genomu referencyjnego
+ref_genome <- "C:/Users/moren/Documents/R/Zaliczenie/GCA_000005845.2_ASM584v2_genomic.fna" # Ścieżka do pliku referencyjnego genomu Escherichia coli w formacie FASTA. Genom referencyjny służy jako punkt odniesienia do mapowania odczytów.
+
+buildindex(basename = "ecoli_index", reference = ref_genome) # Funkcja `buildindex()` tworzy indeks genomu referencyjnego.
+
+# Mapowanie odczytów
+bam_file <- "C:/Users/moren/Documents/R/Zaliczenie/Raport/aligned_reads.bam" # Ścieżka do pliku wynikowego w formacie BAM, który będzie zawierał wyniki mapowania.
+
+align(index = "ecoli_index", 
+      readfile1 = preprocessed_fastq, 
+      input_format = "FASTQ", 
+      output_file = bam_file) # Funkcja `align()` mapuje odczyty na genom referencyjny.
+
+cat("Plik BAM wygenerowany:", bam_file, "\n") # Wyświetla informację o lokalizacji wygenerowanego pliku BAM. Pomaga zweryfikować, czy proces mapowania zakończył się sukcesem.
+```
+
+```{r Analiza wyników mapowania}
+# Import pliku BAM
+aln <- readGAlignments(bam_file) # Wczytanie wyników mapowania z pliku BAM za pomocą funkcji `readGAlignments()`. Obiekt `aln` zawiera wszystkie zmapowane odczyty, w tym ich pozycje w genomie, dopasowania oraz inne szczegóły dotyczące wyników mapowania.
+
+# Obliczenie pokrycia genomu
+coverage_data <- coverage(aln) # Funkcja `coverage()` oblicza liczbę odczytów przypisanych do każdej pozycji w genomie. Zwracany obiekt typu `RleList` przechowuje dane o pokryciu w sposób wydajny pamięciowo.
+
+# Wizualizacja pokrycia genomu
+cov_df <- as.data.frame(coverage_data[[1]])# Konwersja pokrycia dla pierwszego chromosomu/genomu referencyjnego do formatu ramki danych. Pozwala to na łatwiejszą manipulację danymi i wizualizację.
+cov_df$position <- as.numeric(rownames(cov_df)) # Dodanie kolumny `position`, która reprezentuje pozycje w genomie. Konwersja indeksów z nazw wierszy na wartości liczbowe.
+
+#Obliczenie średniego pokrycia genomu:
+mean_coverage <- mean(cov_df$value) # Oblicza średnią wartość pokrycia dla całego genomu. Pokrycie to średnia liczba odczytów przypadająca na każdą pozycję w genomie.
+
+cat("Średnie pokrycie genomu wynosi:", mean_coverage) # Wyświetla wynik średniego pokrycia genomu w konsoli.
+
+# Wizualizacja pokrycia genomu
+library(ggplot2) # Ładowanie biblioteki ggplot2 do tworzenia wykresów.
+ggplot(cov_df[1:25000, ], aes(x = position, y = value)) +
+  geom_line(color = "blue") +
+  labs(title = "Pokrycie genomu E. coli", 
+       x = "Pozycja w genomie", 
+       y = "Liczba zmapowanych odczytów") +
+  theme_minimal()
+# Tworzenie wykresu pokrycia genomu:
+# - `aes(x = position, y = value)`: Pozycje w genomie na osi X, liczba odczytów na osi Y.
+# - `geom_line(color = "blue")`: Rysowanie linii z pokryciem w kolorze niebieskim.
+# - `labs()`: Dodanie tytułu oraz opisów osi.
+# - `theme_minimal()`: Użycie minimalistycznego stylu wykresu.
+
+#Procent odczytów zmapowanych
+total_reads <- 222756  # Całkowita liczba odczytów przed mapowaniem.
+mapped_reads <- 222737  # Liczba odczytów, które zostały poprawnie zmapowane.
+percent_mapped <- (mapped_reads / total_reads) * 100 # Obliczenie procentu zmapowanych odczytów jako (zmapowane odczyty / całkowite odczyty) * 100.
+cat("Procent zmapowanych odczytów:", percent_mapped, "%") # Wyświetla procent zmapowanych odczytów w konsoli.
+
+```
+
+```{r Generowanie raportu QC}
+# Generowanie wyników kontroli jakości (QC)
+qa_results <- qa(preprocessed_fastq, type = "fastq")
+
+# Generowanie raportu w formacie HTML
+report(qa_results, dest = qc_report)
+
+# Wyświetlenie informacji o lokalizacji wygenerowanego raportu
+cat("Raport QC wygenerowany:", qc_report, "\n")
+```
+# W związku z brakiem obecności adapterów, liczba odczytów pozostała niezmieniona. W efekcie, raporty jakości również nie wykazały istotnych zmian, co sugeruje, że dane były już odpowiednio przygotowane pod kątem jakości przed dalszym przetwarzaniem.
